@@ -86,56 +86,17 @@ int KMSDRM_GLES_SetSwapInterval(_THIS, int interval) {
 }
 
 int
-KMSDRM_GLES_SwapWindow(_THIS, SDL_Window * window) {
-    SDL_WindowData *windata = ((SDL_WindowData *) window->driverdata);
-    SDL_DisplayData *dispdata = (SDL_DisplayData *) SDL_GetDisplayForWindow(window)->driverdata;
-    SDL_VideoData *viddata = ((SDL_VideoData *)_this->driverdata);
-    KMSDRM_FBInfo *fb_info;
+KMSDRM_Post_gbm_bo(_THIS, SDL_WindowData *windata, SDL_DisplayData *dispdata, SDL_VideoData *viddata, struct gbm_bo *bo)
+{
     int ret = 0;
+    KMSDRM_FBInfo *fb_info;
 
     /* Always wait for the previous issued flip before issuing a new one,
        even if you do async flips. */
     uint32_t flip_flags = DRM_MODE_PAGE_FLIP_EVENT;
 
-    /* Recreate the GBM / EGL surfaces if the display mode has changed */
-    if (windata->egl_surface_dirty) {
-        KMSDRM_CreateSurfaces(_this, window);
-    }
-
-    /* Wait for confirmation that the next front buffer has been flipped, at which
-       point the previous front buffer can be released */
-    if (!KMSDRM_WaitPageflip(_this, windata)) {
-        SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "Wait for previous pageflip failed");
-        return 0;
-    }
-
-    /* Release the previous front buffer */
-    if (windata->bo) {
-        KMSDRM_gbm_surface_release_buffer(windata->gs, windata->bo);
-        windata->bo = NULL;
-    }
-
-    windata->bo = windata->next_bo;
-
-    /* Mark a buffer to becume the next front buffer.
-       This won't happen until pagelip completes. */
-    if (!(_this->egl_data->eglSwapBuffers(_this->egl_data->egl_display,
-                                           windata->egl_surface))) {
-        SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "eglSwapBuffers failed");
-        return 0;
-    }
-
-    /* From the GBM surface, get the next BO to become the next front buffer,
-       and lock it so it can't be allocated as a back buffer (to prevent EGL
-       from drawing into it!) */
-    windata->next_bo = KMSDRM_gbm_surface_lock_front_buffer(windata->gs);
-    if (!windata->next_bo) {
-        SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "Could not lock front buffer on GBM surface");
-        return 0;
-    }
-
-    /* Get an actual usable fb for the next front buffer. */
-    fb_info = KMSDRM_FBFromBO(_this, windata->next_bo);
+    /* Get an actual usable fb for the front buffer. */
+    fb_info = KMSDRM_FBFromBO(_this, bo);
     if (!fb_info) {
         SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "Could not get a framebuffer");
         return 0;
@@ -196,7 +157,53 @@ KMSDRM_GLES_SwapWindow(_THIS, SDL_Window * window) {
         }
     }
 
-    return 1;
+    return ret;
+}
+
+int
+KMSDRM_GLES_SwapWindow(_THIS, SDL_Window * window) {
+    SDL_WindowData *windata = ((SDL_WindowData *) window->driverdata);
+    SDL_DisplayData *dispdata = (SDL_DisplayData *) SDL_GetDisplayForWindow(window)->driverdata;
+    SDL_VideoData *viddata = ((SDL_VideoData *)_this->driverdata);
+
+    /* Recreate the GBM / EGL surfaces if the display mode has changed */
+    if (windata->egl_surface_dirty) {
+        KMSDRM_CreateSurfaces(_this, window);
+    }
+
+    /* Wait for confirmation that the next front buffer has been flipped, at which
+       point the previous front buffer can be released */
+    if (!KMSDRM_WaitPageflip(_this, windata)) {
+        SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "Wait for previous pageflip failed");
+        return 0;
+    }
+
+    /* Release the previous front buffer */
+    if (windata->bo) {
+        KMSDRM_gbm_surface_release_buffer(windata->gs, windata->bo);
+        windata->bo = NULL;
+    }
+
+    windata->bo = windata->next_bo;
+
+    /* Mark a buffer to becume the next front buffer.
+       This won't happen until pagelip completes. */
+    if (!(_this->egl_data->eglSwapBuffers(_this->egl_data->egl_display,
+                                           windata->egl_surface))) {
+        SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "eglSwapBuffers failed");
+        return 0;
+    }
+
+    /* From the GBM surface, get the next BO to become the next front buffer,
+       and lock it so it can't be allocated as a back buffer (to prevent EGL
+       from drawing into it!) */
+    windata->next_bo = KMSDRM_gbm_surface_lock_front_buffer(windata->gs);
+    if (!windata->next_bo) {
+        SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "Could not lock front buffer on GBM surface");
+        return 0;
+    }
+
+    return KMSDRM_Post_gbm_bo(_this, windata, dispdata, viddata, windata->next_bo);
 }
 
 SDL_EGL_MakeCurrent_impl(KMSDRM)
