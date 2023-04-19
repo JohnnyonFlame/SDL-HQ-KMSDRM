@@ -44,6 +44,7 @@
 #include "SDL_kmsdrmopengles.h"
 #include "SDL_kmsdrmmouse.h"
 #include "SDL_kmsdrmdyn.h"
+#include "SDL_kmsdrmblitter.h"
 #include "SDL_kmsdrmvulkan.h"
 #include <sys/stat.h>
 #include <sys/param.h>
@@ -691,8 +692,13 @@ KMSDRM_AddDisplay (_THIS, drmModeConnector *connector, drmModeRes *resources) {
     modedata->mode_index = mode_index;
 
     display.driverdata = dispdata;
-    display.desktop_mode.w = dispdata->mode.hdisplay;
-    display.desktop_mode.h = dispdata->mode.vdisplay;
+    if ((viddata->rotation & 1) == 0) {
+        display.desktop_mode.w = dispdata->mode.hdisplay;
+        display.desktop_mode.h = dispdata->mode.vdisplay;
+    } else {
+        display.desktop_mode.w = dispdata->mode.vdisplay;
+        display.desktop_mode.h = dispdata->mode.hdisplay;
+    }
     display.desktop_mode.refresh_rate = dispdata->mode.vrefresh;
     display.desktop_mode.format = SDL_PIXELFORMAT_ARGB8888;
     display.desktop_mode.driverdata = modedata;
@@ -728,13 +734,25 @@ cleanup:
    the videomode information, which SDL needs immediately after VideoInit(). */
 static int
 KMSDRM_InitDisplays (_THIS) {
-
+    char *or_str, *rot_str;
+    int rotation = 0;
     SDL_VideoData *viddata = ((SDL_VideoData *)_this->driverdata);
     drmModeRes *resources = NULL;
 
     uint64_t async_pageflip = 0;
     int ret = 0;
     int i;
+
+    /* Determines device rotation FIRST */
+    or_str = SDL_getenv("SDL_KMSDRM_ORIENTATION");
+    rot_str = SDL_getenv("SDL_KMSDRM_ROTATION");
+    if (or_str)
+        rotation = (rotation + SDL_atoi(or_str)) % 4;
+    if (rot_str)
+        rotation = (rotation + SDL_atoi(rot_str)) % 4;
+
+    viddata->rotation = rotation;
+    SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO, "rotation = %d;", rotation);
 
     /* Open /dev/dri/cardNN (/dev/drmN if on OpenBSD version less than 6.9) */
     SDL_snprintf(viddata->devpath, sizeof(viddata->devpath), "%s%d",
@@ -875,6 +893,13 @@ KMSDRM_DestroySurfaces(_THIS, SDL_Window *window)
     SDL_DisplayData *dispdata = (SDL_DisplayData *) SDL_GetDisplayForWindow(window)->driverdata;
     int ret;
 
+    /* Destroy blitter first */
+    if (windata->blitter) {
+        KMSDRM_BlitterQuit(windata->blitter);
+        SDL_free(windata->blitter);
+        windata->blitter = NULL;
+    }
+
     /**********************************************/
     /* Wait for last issued pageflip to complete. */
     /**********************************************/
@@ -936,7 +961,7 @@ KMSDRM_DestroySurfaces(_THIS, SDL_Window *window)
 }
 
 static void
-KMSDRM_GetModeToSet(SDL_Window *window, drmModeModeInfo *out_mode) {
+KMSDRM_GetModeToSet(SDL_Window *window, drmModeModeInfo *out_mode, int rotation) {
     SDL_VideoDisplay *display = SDL_GetDisplayForWindow(window);
     SDL_DisplayData *dispdata = (SDL_DisplayData *)display->driverdata;
 
@@ -945,8 +970,11 @@ KMSDRM_GetModeToSet(SDL_Window *window, drmModeModeInfo *out_mode) {
     } else {
         drmModeModeInfo *mode;
 
-        mode = KMSDRM_GetClosestDisplayMode(display,
-          window->windowed.w, window->windowed.h, 0);
+        if ((rotation & 1) == 0) {
+            mode = KMSDRM_GetClosestDisplayMode(display, window->w, window->h, 0);
+        } else {
+            mode = KMSDRM_GetClosestDisplayMode(display, window->h, window->w, 0);
+        }
 
         if (mode) {
             *out_mode = *mode;
@@ -957,7 +985,7 @@ KMSDRM_GetModeToSet(SDL_Window *window, drmModeModeInfo *out_mode) {
 }
 
 static void
-KMSDRM_DirtySurfaces(SDL_Window *window) {
+KMSDRM_DirtySurfaces(SDL_Window *window, int rotation) {
     SDL_WindowData *windata = (SDL_WindowData *)window->driverdata;
     drmModeModeInfo mode;
 
@@ -968,7 +996,7 @@ KMSDRM_DirtySurfaces(SDL_Window *window) {
     /* The app may be waiting for the resize event after calling SetWindowSize
        or SetWindowFullscreen, send a fake event for now since the actual
        recreation is deferred */
-    KMSDRM_GetModeToSet(window, &mode);
+    KMSDRM_GetModeToSet(window, &mode, rotation);
     SDL_SendWindowEvent(window, SDL_WINDOWEVENT_RESIZED, mode.hdisplay, mode.vdisplay);
 }
 
@@ -1003,15 +1031,20 @@ KMSDRM_CreateSurfaces(_THIS, SDL_Window * window)
     /* The KMSDRM backend doesn't always set the mode the higher-level code in
        SDL_video.c expects. Hulk-smash the display's current_mode to keep the
        mode that's set in sync with what SDL_video.c thinks is set */
-    KMSDRM_GetModeToSet(window, &dispdata->mode);
+    KMSDRM_GetModeToSet(window, &dispdata->mode, viddata->rotation);
 
-    display->current_mode.w = dispdata->mode.hdisplay;
-    display->current_mode.h = dispdata->mode.vdisplay;
+    if ((viddata->rotation & 1) == 0) {
+        display->current_mode.w = dispdata->mode.hdisplay;
+        display->current_mode.h = dispdata->mode.vdisplay;
+    } else {
+        display->current_mode.w = dispdata->mode.vdisplay;
+        display->current_mode.h = dispdata->mode.hdisplay;
+    }
     display->current_mode.refresh_rate = dispdata->mode.vrefresh;
     display->current_mode.format = SDL_PIXELFORMAT_ARGB8888;
 
     windata->gs = KMSDRM_gbm_surface_create(viddata->gbm_dev,
-                      dispdata->mode.hdisplay, dispdata->mode.vdisplay,
+                      window->w, window->h,
                       surface_fmt, surface_flags);
 
     if (!windata->gs) {
@@ -1034,8 +1067,27 @@ KMSDRM_CreateSurfaces(_THIS, SDL_Window * window)
     egl_context = (EGLContext)SDL_GL_GetCurrentContext();
     ret = SDL_EGL_MakeCurrent(_this, windata->egl_surface, egl_context);
 
-    SDL_SendWindowEvent(window, SDL_WINDOWEVENT_RESIZED,
-                        dispdata->mode.hdisplay, dispdata->mode.vdisplay);
+    /* Create blitter thread */
+    windata->blitter = SDL_calloc(1, sizeof(KMSDRM_Blitter));
+    *windata->blitter = (KMSDRM_Blitter){
+        ._this = _this,
+        .window = window,
+        .egl_display = _this->egl_data->egl_display,
+        .viewport_width = dispdata->mode.hdisplay,
+        .viewport_height = dispdata->mode.vdisplay,
+        .plane_width = window->w,
+        .plane_height = window->h,
+        .rotation = viddata->rotation
+    };
+
+    KMSDRM_BlitterInit(windata->blitter);
+
+    /* Wait until the thread is ready */
+    SDL_LockMutex(windata->blitter->mutex);
+    SDL_CondWait(windata->blitter->cond, windata->blitter->mutex);
+    SDL_UnlockMutex(windata->blitter->mutex);
+
+    SDL_SendWindowEvent(window, SDL_WINDOWEVENT_RESIZED, window->w, window->h);
 
     windata->egl_surface_dirty = SDL_FALSE;
 
@@ -1109,6 +1161,7 @@ KMSDRM_VideoQuit(_THIS)
 void
 KMSDRM_GetDisplayModes(_THIS, SDL_VideoDisplay * display)
 {
+    SDL_VideoData *viddata = ((SDL_VideoData *)_this->driverdata);
     SDL_DisplayData *dispdata = display->driverdata;
     drmModeConnector *conn = dispdata->connector;
     SDL_DisplayMode mode;
@@ -1121,8 +1174,14 @@ KMSDRM_GetDisplayModes(_THIS, SDL_VideoDisplay * display)
             modedata->mode_index = i;
         }
 
-        mode.w = conn->modes[i].hdisplay;
-        mode.h = conn->modes[i].vdisplay;
+        if ((viddata->rotation & 1) == 0) {
+            mode.w = conn->modes[i].hdisplay;
+            mode.h = conn->modes[i].vdisplay;
+        } else {
+            mode.w = conn->modes[i].vdisplay;
+            mode.h = conn->modes[i].hdisplay;
+        }
+
         mode.refresh_rate = conn->modes[i].vrefresh;
         mode.format = SDL_PIXELFORMAT_ARGB8888;
         mode.driverdata = modedata;
@@ -1159,7 +1218,7 @@ KMSDRM_SetDisplayMode(_THIS, SDL_VideoDisplay * display, SDL_DisplayMode * mode)
     dispdata->fullscreen_mode = conn->modes[modedata->mode_index];
 
     for (i = 0; i < viddata->num_windows; i++) {
-        KMSDRM_DirtySurfaces(viddata->windows[i]);
+        KMSDRM_DirtySurfaces(viddata->windows[i], viddata->rotation);
     }
 
     return 0;
@@ -1429,7 +1488,7 @@ KMSDRM_SetWindowSize(_THIS, SDL_Window * window)
 {
     SDL_VideoData *viddata = ((SDL_VideoData *)_this->driverdata);
     if (!viddata->vulkan_mode) {
-        KMSDRM_DirtySurfaces(window);
+        KMSDRM_DirtySurfaces(window, viddata->rotation);
     }
 }
 void
@@ -1438,7 +1497,7 @@ KMSDRM_SetWindowFullscreen(_THIS, SDL_Window * window, SDL_VideoDisplay * displa
 {
     SDL_VideoData *viddata = ((SDL_VideoData *)_this->driverdata);
     if (!viddata->vulkan_mode) {
-        KMSDRM_DirtySurfaces(window);
+        KMSDRM_DirtySurfaces(window, viddata->rotation);
     }
 }
 void

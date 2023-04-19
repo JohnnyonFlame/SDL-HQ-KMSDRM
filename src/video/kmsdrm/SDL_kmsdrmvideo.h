@@ -48,6 +48,7 @@ typedef struct SDL_VideoData
     SDL_Window **windows;
     int max_windows;
     int num_windows;
+    int rotation;
 
     /* Even if we have several displays, we only have to
        open 1 FD and create 1 gbm device. */
@@ -93,6 +94,7 @@ typedef struct SDL_WindowData
     struct gbm_surface *gs;
     struct gbm_bo *bo;
     struct gbm_bo *next_bo;
+    struct KMSDRM_Blitter *blitter;
 
     SDL_bool waiting_for_flip;
     SDL_bool double_buffer;

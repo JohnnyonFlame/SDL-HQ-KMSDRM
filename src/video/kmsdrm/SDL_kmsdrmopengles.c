@@ -28,6 +28,7 @@
 #include "SDL_kmsdrmvideo.h"
 #include "SDL_kmsdrmopengles.h"
 #include "SDL_kmsdrmdyn.h"
+#include "SDL_kmsdrmblitter.h"
 #include <errno.h>
 
 #ifndef EGL_PLATFORM_GBM_MESA
@@ -41,11 +42,9 @@ KMSDRM_GLES_DefaultProfileConfig(_THIS, int *mask, int *major, int *minor)
 {
     /* if SDL was _also_ built with the Raspberry Pi driver (so we're
        definitely a Pi device), default to GLES2. */
-#if SDL_VIDEO_DRIVER_RPI
     *mask = SDL_GL_CONTEXT_PROFILE_ES;
     *major = 2;
     *minor = 0;
-#endif
 }
 
 int
@@ -86,7 +85,7 @@ int KMSDRM_GLES_SetSwapInterval(_THIS, int interval) {
 }
 
 int
-KMSDRM_Post_gbm_bo(_THIS, SDL_WindowData *windata, SDL_DisplayData *dispdata, SDL_VideoData *viddata, struct gbm_bo *bo)
+KMSDRM_Post_gbm_bo(_THIS, SDL_WindowData *windata, SDL_DisplayData *dispdata, SDL_VideoData *viddata, struct gbm_bo *bo, struct gbm_bo *next_bo)
 {
     int ret = 0;
     KMSDRM_FBInfo *fb_info;
@@ -96,13 +95,13 @@ KMSDRM_Post_gbm_bo(_THIS, SDL_WindowData *windata, SDL_DisplayData *dispdata, SD
     uint32_t flip_flags = DRM_MODE_PAGE_FLIP_EVENT;
 
     /* Get an actual usable fb for the front buffer. */
-    fb_info = KMSDRM_FBFromBO(_this, bo);
+    fb_info = KMSDRM_FBFromBO(_this, next_bo);
     if (!fb_info) {
         SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "Could not get a framebuffer");
         return 0;
     }
 
-    if (!windata->bo) {
+    if (!bo) {
         /* On the first swap, immediately present the new front buffer. Before
            drmModePageFlip can be used the CRTC has to be configured to use
            the current connector and mode with drmModeSetCrtc */
@@ -111,7 +110,7 @@ KMSDRM_Post_gbm_bo(_THIS, SDL_WindowData *windata, SDL_DisplayData *dispdata, SD
           &dispdata->connector->connector_id, 1, &dispdata->mode);
 
         if (ret) {
-            SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "Could not set videomode on CRTC.");
+            SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "Could not set videomode on CRTC: (%d).", ret);
             return 0;
         }
     } else {
@@ -136,7 +135,7 @@ KMSDRM_Post_gbm_bo(_THIS, SDL_WindowData *windata, SDL_DisplayData *dispdata, SD
 
         if (ret == 0) {
             windata->waiting_for_flip = SDL_TRUE;
-        } else {
+        } else if (ret != -22) {
             SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "Could not queue pageflip: %d", ret);
         }
 
@@ -165,6 +164,7 @@ KMSDRM_GLES_SwapWindow(_THIS, SDL_Window * window) {
     SDL_WindowData *windata = ((SDL_WindowData *) window->driverdata);
     SDL_DisplayData *dispdata = (SDL_DisplayData *) SDL_GetDisplayForWindow(window)->driverdata;
     SDL_VideoData *viddata = ((SDL_VideoData *)_this->driverdata);
+    KMSDRM_Blitter *blitter = windata->blitter;
 
     /* Recreate the GBM / EGL surfaces if the display mode has changed */
     if (windata->egl_surface_dirty) {
@@ -173,7 +173,14 @@ KMSDRM_GLES_SwapWindow(_THIS, SDL_Window * window) {
 
     /* Wait for confirmation that the next front buffer has been flipped, at which
        point the previous front buffer can be released */
-    if (!KMSDRM_WaitPageflip(_this, windata)) {
+    if (blitter) {
+        /* If we're using the blitter, we wait for an available buffer and then fence it */
+        SDL_LockMutex(blitter->mutex);
+        blitter->planes[blitter->next].fence = _this->egl_data->eglCreateSyncKHR(
+            _this->egl_data->egl_display,
+            EGL_SYNC_FENCE_KHR,
+            NULL);
+    } else if (!KMSDRM_WaitPageflip(_this, windata)) {
         SDL_LogError(SDL_LOG_CATEGORY_VIDEO, "Wait for previous pageflip failed");
         return 0;
     }
@@ -203,7 +210,16 @@ KMSDRM_GLES_SwapWindow(_THIS, SDL_Window * window) {
         return 0;
     }
 
-    return KMSDRM_Post_gbm_bo(_this, windata, dispdata, viddata, windata->next_bo);
+    /* Either buffer object to the blitter or post directly to kmsdrm */
+    if (blitter) {
+        blitter->planes[blitter->next].bo = windata->next_bo;
+        SDL_CondSignal(blitter->cond);
+        SDL_UnlockMutex(blitter->mutex);
+        return 1;
+    } else {
+        return KMSDRM_Post_gbm_bo(_this, windata, dispdata, viddata, windata->bo, windata->next_bo);
+    }
+
 }
 
 SDL_EGL_MakeCurrent_impl(KMSDRM)
